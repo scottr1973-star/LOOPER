@@ -1,3 +1,6 @@
+<!-- /index.html — Looper8+ MOBILE FIX (Mic enable + Record + WAV export + Save/Load)
+     Scope: ONLY mic init/recording + export + save/load logic. UI/other behavior untouched.
+     Created by Scott Russo -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9,7 +12,7 @@
         --g1:#00e676;--g2:#29b6f6;--g3:#ffd54f;--g4:#ff8a65;--g5:#a1887f;--g6:#b39ddb;--g7:#80cbc4;--g8:#ffcc80;
         --rec:#ff5252;--ledOff:#18302b}
   *{box-sizing:border-box}
-  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  html,body{margin:0;height:100%;background:var(--bg);color:#e8f5e9;font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
   .wrap{max-width:980px;margin:0 auto;padding:14px}
   h1{margin:4px 0 8px;font-size:18px}
   .card{background:linear-gradient(180deg,#111718,#0e1416);border:1px solid var(--line);border-radius:12px;padding:10px}
@@ -103,10 +106,10 @@
 
 <script>
 (() => {
-  // ====== Tunables (fix short cuts & multi-click) ======
-  const PRE_ROLL_MS   = 120; // start recording a bit BEFORE boundary
-  const TAIL_MS       = 60;  // keep recording a bit AFTER boundary
-  const NO_LOOP_STOP_GRACE_MS = 80; // manual stop tail
+  // ====== Tunables ======
+  const PRE_ROLL_MS   = 120;     // capture BEFORE boundary and trim later
+  const TAIL_MS       = 60;      // keep a little tail after boundary
+  const NO_LOOP_STOP_GRACE_MS = 80;
 
   // ====== State ======
   const N = 8, LED_CELLS = 16;
@@ -115,7 +118,9 @@
   let loopLenSec = null, playing = false, startAt = 0;
   let inputNode = null, analyser = null, monitorGain = null;
   let recBusy = false;
-  let recSchedule = null; // { track, startAtCtx, stopAtCtx, boundaryAtCtx }
+  let recSchedule = null; // {track, startAtCtxActual, stopAtCtx, boundaryAtCtx}
+  let fallbackRec = null; // iOS/Safari path
+  let hiddenFileInput = null;
 
   const tracks = Array.from({length:N}, (_,i)=>({
     i, label:'T'+(i+1), colorClass:'c'+(i+1),
@@ -193,54 +198,67 @@
   function enableTrackControls(on){
     document.querySelectorAll('.ctrls .btn').forEach(b=>{
       const label = b.textContent;
-      if (label==='Rec') b.disabled = !on || !mediaRec;
+      if (label==='Rec') b.disabled = !on;
       else if (label==='Stop Rec') b.disabled = true;
       else b.disabled = !on;
     });
     document.querySelectorAll('.vol').forEach(v=> v.disabled = !on);
   }
 
-  // ====== Core guards ======
+  // ====== Audio setup (MOBILE-SAFE) ======
   async function ensureAudioReady(){
     if (!audioCtx){ audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }
     if (audioCtx.state === 'suspended'){ try{ await audioCtx.resume(); }catch{} }
   }
-  async function ensureMicAndRecorder(){
+
+  async function ensureMic(){
+    // Secure origin & top-level checks (GitHub Pages is OK)
+    const secureOrigin = location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+    if (!secureOrigin){ toast('Open over HTTPS or localhost for mic.'); return false; }
+    if (window.top !== window.self){ toast('If embedded in an iframe, add allow="microphone".'); return false; }
+
     if (!mediaStream){
       try{
-        mediaStream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}, video:false});
+        // Simplest constraints for widest device support
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
       }catch(e){
-        toast('Mic denied. Allow mic to record.');
+        toast('Mic blocked. Allow mic for this site in the browser & system settings, then reload.');
         return false;
       }
     }
-    if (!mediaRec){
-      const mime = getBestMime();
-      if (!mime){ toast('MediaRecorder not supported in this browser.'); return false; }
-      mediaRec = new MediaRecorder(mediaStream, {mimeType: mime});
-      mediaRec.ondataavailable = (e)=> { if (e.data && e.data.size) chunks.push(e.data); };
-      mediaRec.onstop = onRecordingComplete;
-
+    // WebAudio path
+    if (!inputNode){
       inputNode = audioCtx.createMediaStreamSource(mediaStream);
       analyser = audioCtx.createAnalyser(); analyser.fftSize = 512; analyser.smoothingTimeConstant = 0.85;
       monitorGain = audioCtx.createGain(); monitorGain.gain.value = 0.0;
       inputNode.connect(analyser); analyser.connect(monitorGain); monitorGain.connect(audioCtx.destination);
-      monitorChk.disabled = true; // keep off by default to avoid feedback
       tickMeter();
     }
+    // MediaRecorder if supported
+    if (!mediaRec && window.MediaRecorder){
+      const mime = getBestMime();
+      try{ mediaRec = mime ? new MediaRecorder(mediaStream, {mimeType:mime}) : new MediaRecorder(mediaStream); }
+      catch{ mediaRec = null; }
+      if (mediaRec){
+        mediaRec.ondataavailable = (e)=> { if (e.data && e.data.size) chunks.push(e.data); };
+        mediaRec.onstop = onRecordingComplete_MediaRecorder;
+      }
+    }
+    // Fallback (iOS/Safari)
+    if (!fallbackRec){ fallbackRec = createFallbackRecorder(inputNode, audioCtx); }
     return true;
   }
 
-  // ====== Init / Transport ======
   initBtn.addEventListener('click', async ()=>{
     await ensureAudioReady();
-    const ok = await ensureMicAndRecorder();
+    const ok = await ensureMic();
     tracks.forEach(tr=>{ if (!tr.gainNode){ const g=audioCtx.createGain(); g.gain.value=0.9; g.connect(audioCtx.destination); tr.gainNode=g; }});
-    playBtn.disabled = false; stopBtn.disabled = false;
-    enableTrackControls(true);
-    initBtn.disabled = true; initBtn.textContent = ok ? 'Audio Ready' : 'Audio (no recorder)';
+    playBtn.disabled = !ok; stopBtn.disabled = !ok;
+    enableTrackControls(ok);
+    if (ok){ initBtn.disabled = true; initBtn.textContent = 'Audio Ready'; }
   });
 
+  // ====== Transport ======
   playBtn.addEventListener('click', async ()=>{
     await ensureAudioReady();
     if (!loopLenSec){ const v = Math.max(0.5, Number(loopLenInput.value)||0); loopLenSec = v; setLoopLenDisplay(); }
@@ -273,7 +291,7 @@
     playing = false;
   }
 
-  // ====== Recording (boundary-accurate) ======
+  // ====== Recording (MOBILE-SAFE; trim-to-boundary) ======
   async function safeRecordStart(i, recBtn, stopRecBtn){
     if (recBusy) return; recBusy = true;
 
@@ -281,7 +299,7 @@
     tr(i).recChip.textContent='Arming…';
 
     await ensureAudioReady();
-    const ok = await ensureMicAndRecorder();
+    const ok = await ensureMic();
     if (!ok){ tr(i).recChip.className='chip idle'; tr(i).recChip.textContent='Idle'; recBusy=false; return; }
 
     // UI lock
@@ -291,45 +309,62 @@
     tr(i).progressEl.classList.add('rec');
     tr(i).recChip.className='chip rec'; tr(i).recChip.textContent='REC';
 
+    const usingMediaRecorder = !!mediaRec;
+
     if (loopLenSec && playing){
       const now = audioCtx.currentTime;
       const elapsed = (now - startAt) % loopLenSec;
       let timeToBoundary = loopLenSec - elapsed;
       if (timeToBoundary < PRE_ROLL_MS/1000 + 0.04) timeToBoundary += loopLenSec;
-
       const boundaryAt = now + timeToBoundary;
-      const startAtCtx = boundaryAt - (PRE_ROLL_MS/1000);
-      const stopAtCtx  = boundaryAt + loopLenSec + (TAIL_MS/1000);
-      recSchedule = { track: i, startAtCtx, stopAtCtx, boundaryAtCtx: boundaryAt };
+      const stopAtCtx = boundaryAt + loopLenSec + (TAIL_MS/1000);
 
-      waitUntil(startAtCtx, async () => {
-        if (!mediaRec) return endRecUI(i);
-        try { mediaRec.start(); } catch(e){ toast('Recorder failed to start.'); return endRecUI(i); }
+      if (usingMediaRecorder){
+        // Start immediately on tap (mobile requirement). We'll trim to boundary later.
+        let startActual = audioCtx.currentTime;
+        try { mediaRec.start(); } catch(e){ toast('Recorder failed to start.'); endRecUI(i); recBusy=false; return; }
+        recSchedule = { track:i, startAtCtxActual:startActual, stopAtCtx, boundaryAtCtx:boundaryAt };
         sweepRecordLEDs(i);
-      });
-
-      waitUntil(stopAtCtx, () => {
-        if (mediaRec && mediaRec.state === 'recording') {
-          try { if (mediaRec.requestData) mediaRec.requestData(); } catch {}
-          mediaRec.stop();
-        }
-      });
+        waitUntil(stopAtCtx, () => {
+          if (mediaRec && mediaRec.state === 'recording') {
+            try { if (mediaRec.requestData) mediaRec.requestData(); } catch {}
+            mediaRec.stop();
+          }
+        });
+      } else {
+        // Fallback on iOS
+        fallbackRec.start();
+        fallbackRec._startCtxActual = audioCtx.currentTime;
+        recSchedule = { track:i, startAtCtxActual:fallbackRec._startCtxActual, stopAtCtx, boundaryAtCtx:boundaryAt };
+        sweepRecordLEDs(i);
+        waitUntil(stopAtCtx, () => { fallbackRec.stop(); onRecordingComplete_Fallback(i); });
+      }
 
     } else {
-      try { mediaRec.start(); } catch(e){ toast('Recorder failed to start.'); endRecUI(i); recBusy=false; return; }
-      sweepRecordLEDs(i);
+      // Free record (no loop defined yet)
+      if (usingMediaRecorder){
+        try { mediaRec.start(); } catch(e){ toast('Recorder failed to start.'); endRecUI(i); recBusy=false; return; }
+        sweepRecordLEDs(i);
+      } else {
+        fallbackRec.start(); fallbackRec._startCtxActual = audioCtx.currentTime;
+        sweepRecordLEDs(i);
+      }
     }
 
     recBusy = false;
   }
 
   function stopRecording(){
-    if (!mediaRec || mediaRec.state !== 'recording') return;
     const t = audioCtx.currentTime;
-    waitUntil(t + NO_LOOP_STOP_GRACE_MS/1000, () => {
-      try { if (mediaRec.requestData) mediaRec.requestData(); } catch {}
-      mediaRec.stop();
-    });
+    const when = t + NO_LOOP_STOP_GRACE_MS/1000;
+    if (mediaRec && mediaRec.state === 'recording'){
+      waitUntil(when, () => {
+        try { if (mediaRec.requestData) mediaRec.requestData(); } catch {}
+        mediaRec.stop();
+      });
+    } else if (fallbackRec && fallbackRec.isRecording){
+      waitUntil(when, () => { fallbackRec.stop(); onRecordingComplete_Fallback(recordingTrack); });
+    }
   }
 
   function waitUntil(whenCtxTime, fn){
@@ -341,28 +376,30 @@
     requestAnimationFrame(tick);
   }
 
-  async function onRecordingComplete(){
+  // MediaRecorder completion
+  async function onRecordingComplete_MediaRecorder(){
     const i = recordingTrack; recordingTrack = -1;
     tr(i).recChip.className='chip idle'; tr(i).recChip.textContent='Idle';
 
     const blob = new Blob(chunks, {type: chunks[0]?.type || 'audio/webm'});
     let ab; try { ab = await blob.arrayBuffer(); } catch { endRecUI(i); return; }
     let buf = await audioCtx.decodeAudioData(ab).catch(()=>null);
-    if (!buf){ toast('Decode failed. Try Chrome/Edge.'); endRecUI(i); return; }
+    if (!buf){ toast('Decode failed. Try Chrome/Edge/Safari 17+.'); endRecUI(i); return; }
 
     buf = toMonoWithFades(buf, 0.004);
 
     if (recSchedule && recSchedule.track === i){
       const sr = buf.sampleRate;
-      const pre  = Math.floor((PRE_ROLL_MS/1000) * sr);
-      const want = Math.floor(loopLenSec * sr);
+      const startActual = recSchedule.startAtCtxActual;
+      const boundary = recSchedule.boundaryAtCtx;
+      // Trim from actual start to boundary, take exactly one loop
+      let pre = Math.max(0, Math.floor((boundary - startActual) * sr));
+      const want = Math.max(1, Math.floor(loopLenSec * sr));
       let data = buf.getChannelData(0);
       const headTrim = Math.min(pre, data.length);
       data = data.subarray(headTrim);
       const out = audioCtx.createBuffer(1, want, sr);
-      const o = out.getChannelData(0);
-      const n = Math.min(want, data.length);
-      o.set(data.subarray(0, n), 0);
+      out.getChannelData(0).set(data.subarray(0, want), 0);
       buf = out;
       recSchedule = null;
     } else {
@@ -375,9 +412,50 @@
 
     tracks[i].buffer = buf;
     tr(i).statusEl.textContent = 'Ready ('+buf.duration.toFixed(2)+'s)';
+    exportMixBtn.disabled = false; exportStemsBtn.disabled = false;
 
-    exportMixBtn.disabled = false; exportMixBtn.removeAttribute('title');
-    exportStemsBtn.disabled = false; exportStemsBtn.removeAttribute('title');
+    if (playing){
+      if (tr(i).source){ try{ tr(i).source.stop(); }catch{} tr(i).source.disconnect(); }
+      const src = audioCtx.createBufferSource();
+      src.buffer = normalizeToLoop(buf, loopLenSec); src.loop=true; src.loopStart=0; src.loopEnd=loopLenSec;
+      src.connect(tr(i).gainNode);
+      const now = audioCtx.currentTime; const elapsed=(now-startAt)%loopLenSec;
+      src.start(now, elapsed); tr(i).source = src;
+    }
+    endRecUI(i);
+  }
+
+  // Fallback completion (iOS)
+  function onRecordingComplete_Fallback(i){
+    tr(i).recChip.className='chip idle'; tr(i).recChip.textContent='Idle';
+    let buf = fallbackRec.getAudioBuffer();
+    if (!buf){ endRecUI(i); return; }
+    buf = toMonoWithFades(buf, 0.004);
+
+    if (recSchedule && recSchedule.track === i){
+      const sr = buf.sampleRate;
+      const startActual = recSchedule.startAtCtxActual;
+      const boundary = recSchedule.boundaryAtCtx;
+      const pre = Math.max(0, Math.floor((boundary - startActual) * sr));
+      const want = Math.max(1, Math.floor(loopLenSec * sr));
+      let data = buf.getChannelData(0);
+      const headTrim = Math.min(pre, data.length);
+      data = data.subarray(headTrim);
+      const out = audioCtx.createBuffer(1, want, sr);
+      out.getChannelData(0).set(data.subarray(0, want), 0);
+      buf = out;
+      recSchedule = null;
+    } else {
+      if (!loopLenSec){
+        loopLenSec = Math.max(0.5, Number(loopLenInput.value)||buf.duration);
+        setLoopLenDisplay();
+      }
+      buf = fitBufferToLoop(buf, loopLenSec);
+    }
+
+    tracks[i].buffer = buf;
+    tr(i).statusEl.textContent = 'Ready ('+buf.duration.toFixed(2)+'s)';
+    exportMixBtn.disabled = false; exportStemsBtn.disabled = false;
 
     if (playing){
       if (tr(i).source){ try{ tr(i).source.stop(); }catch{} tr(i).source.disconnect(); }
@@ -393,7 +471,7 @@
   function endRecUI(i){
     document.querySelectorAll('.ctrls .btn').forEach(b=>{
       if (b.textContent==='Stop Rec') b.disabled = true;
-      if (b.textContent==='Rec') b.disabled = !mediaRec;
+      if (b.textContent==='Rec') b.disabled = false;
     });
     const f = tr(i).progressEl; if (f) f.classList.remove('rec');
   }
@@ -401,9 +479,10 @@
   function sweepRecordLEDs(i){
     const r = tr(i);
     const tick = ()=>{
-      if (!mediaRec || mediaRec.state!=='recording'){ r.leds.forEach(d=>d.classList.remove('on')); return; }
+      const recActive = (mediaRec && mediaRec.state==='recording') || (fallbackRec && fallbackRec.isRecording);
+      if (!recActive){ r.leds.forEach(d=>d.classList.remove('on')); return; }
       const now = audioCtx.currentTime;
-      const frac = loopLenSec ? ((now - startAt) % loopLenSec) / loopLenSec : ((now*1.0) % 1.0);
+      const frac = loopLenSec && playing ? ((now - startAt) % loopLenSec) / loopLenSec : ((now*1.0) % 1.0);
       const pos = Math.floor(frac * LED_CELLS) % LED_CELLS;
       r.leds.forEach((d, idx)=> d.classList.toggle('on', idx===pos));
       requestAnimationFrame(tick);
@@ -464,7 +543,7 @@
     loopLenInput.value = loopLenSec.toFixed(2);
   }
 
-  // ====== Export ======
+  // ====== EXPORT (Android + iOS) ======
   exportMixBtn.addEventListener('click', async ()=>{
     if (!hasAudio()) { toast('Record something first.'); return; }
     const sr = audioCtx?.sampleRate || 44100;
@@ -483,7 +562,7 @@
       src.start(0);
     });
     const rendered = await off.startRendering();
-    downloadWav(rendered, `looper8_mix_${loopLenSec.toFixed(2)}s.wav`);
+    downloadBlobAs(bufferToWavBlob(rendered), `looper8_mix_${loopLenSec.toFixed(2)}s.wav`);
   });
 
   exportStemsBtn.addEventListener('click', ()=>{
@@ -491,7 +570,7 @@
     tracks.forEach((t, idx)=>{
       if (!t.buffer) return;
       const b = normalizeToLoop(t.buffer, loopLenSec);
-      downloadWav(b, `looper8_t${idx+1}_${loopLenSec.toFixed(2)}s.wav`);
+      downloadBlobAs(bufferToWavBlob(b), `looper8_t${idx+1}_${loopLenSec.toFixed(2)}s.wav`);
     });
   });
 
@@ -501,11 +580,127 @@
     return row ? Number(row.querySelector('.vol').value)||1 : 1;
   }
 
-  function downloadWav(buffer, filename){
+  // ====== SAVE / LOAD (single JSON with embedded WAVs) ======
+  saveSessBtn.addEventListener('click', async ()=>{
+    if (!audioCtx){ toast('Nothing to save yet.'); return; }
+    const rowEls = Array.from(document.querySelectorAll('.tracks .track'));
+    const loopSec = loopLenSec || Math.max(0.5, Number(loopLenInput.value)||2);
+
+    const payload = {
+      version: 1,
+      loopLenSec: loopSec,
+      tracks: await Promise.all(tracks.map(async (t, idx)=>{
+        const row = rowEls[idx];
+        const vol = row ? Number(row.querySelector('.vol').value)||0.9 : 0.9;
+        const obj = { muted: t.muted, solo: t.solo, vol, wavDataUrl: null };
+        if (t.buffer){
+          const b = normalizeToLoop(t.buffer, loopSec);
+          const wavBlob = bufferToWavBlob(b);
+          obj.wavDataUrl = await blobToDataURL(wavBlob);
+        }
+        return obj;
+      }))
+    };
+
+    const jsonBlob = new Blob([JSON.stringify(payload)], {type:'application/json'});
+    downloadBlobAs(jsonBlob, `looper8_session.json`);
+    toast('Session saved.');
+  });
+
+  loadSessBtn.addEventListener('click', async ()=>{
+    if (!hiddenFileInput){
+      hiddenFileInput = document.createElement('input');
+      hiddenFileInput.type = 'file';
+      hiddenFileInput.accept = 'application/json';
+      hiddenFileInput.style.display = 'none';
+      document.body.appendChild(hiddenFileInput);
+      hiddenFileInput.addEventListener('change', async (e)=>{
+        const file = e.target.files[0];
+        if (!file) return;
+        const text = await file.text().catch(()=>null);
+        if (!text){ toast('Load failed.'); return; }
+        let payload = null;
+        try{ payload = JSON.parse(text); }catch{ toast('Invalid session file.'); return; }
+
+        await ensureAudioReady();
+        stopPlayback();
+
+        loopLenSec = Math.max(0.5, Number(payload.loopLenSec)||2);
+        setLoopLenDisplay();
+
+        const rowEls = Array.from(document.querySelectorAll('.tracks .track'));
+
+        for (let i=0;i<tracks.length;i++){
+          const t = tr(i);
+          const data = payload.tracks?.[i];
+
+          if (t.source){ try{ t.source.stop(); }catch{} t.source.disconnect(); t.source=null; }
+          t.buffer = null;
+
+          const row = rowEls[i];
+          const vol = data?.vol ?? 0.9;
+          if (row){ row.querySelector('.vol').value = String(vol); }
+
+          t.muted = !!data?.muted;
+          t.solo  = !!data?.solo;
+          if (row){
+            row.querySelectorAll('.ctrls .btn').forEach(b=>{
+              if (b.textContent==='Mute') b.textContent = t.muted ? 'Unmute' : 'Mute';
+              if (b.textContent==='Solo') b.textContent = t.solo ? 'Unsolo' : 'Solo';
+            });
+          }
+
+          if (data?.wavDataUrl){
+            const wavAb = dataURLToArrayBuffer(data.wavDataUrl);
+            const buf = await audioCtx.decodeAudioData(wavAb).catch(()=>null);
+            if (buf){
+              t.buffer = normalizeToLoop(toMonoWithFades(buf, 0.004), loopLenSec);
+              t.statusEl.textContent = 'Ready ('+t.buffer.duration.toFixed(2)+'s)';
+            } else {
+              t.statusEl.textContent = '—';
+            }
+          } else {
+            t.statusEl.textContent = '—';
+          }
+        }
+
+        exportMixBtn.disabled = !tracks.some(x=>x.buffer);
+        exportStemsBtn.disabled = !tracks.some(x=>x.buffer);
+        refreshGains();
+        toast('Session loaded.');
+      });
+    }
+    hiddenFileInput.value = '';
+    hiddenFileInput.click();
+  });
+
+  // ====== Download helpers (mobile-safe) ======
+  function downloadBlobAs(blob, filename){
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; a.rel='noopener'; a.target = '_blank'; // iOS fallback
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(()=>{ try{document.body.removeChild(a);}catch{} URL.revokeObjectURL(url); }, 1500);
+  }
+  async function blobToDataURL(blob){
+    return new Promise((res, rej)=>{
+      const r = new FileReader(); r.onload = ()=> res(r.result); r.onerror = rej; r.readAsDataURL(blob);
+    });
+  }
+  function dataURLToArrayBuffer(dataURL){
+    const comma = dataURL.indexOf(',');
+    const base64 = dataURL.slice(comma+1);
+    const bin = atob(base64);
+    const len = bin.length; const buf = new ArrayBuffer(len); const view = new Uint8Array(buf);
+    for (let i=0;i<len;i++) view[i] = bin.charCodeAt(i);
+    return buf;
+  }
+
+  // ====== WAV utils ======
+  function bufferToWavBlob(buffer){
     const wav = encodeWAV(buffer);
-    const blob = new Blob([wav], {type:'audio/wav'});
-    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = filename; a.click();
-    setTimeout(()=> URL.revokeObjectURL(a.href), 1000);
+    return new Blob([wav], {type:'audio/wav'});
   }
   function encodeWAV(buffer){
     const numCh=1, sr=buffer.sampleRate, data=buffer.getChannelData(0), len=data.length;
@@ -539,7 +734,7 @@
     const o = out.getChannelData(0); const iData = buf.getChannelData(0);
     const n = Math.min(want, buf.length); o.set(iData.subarray(0,n), 0);
     const f = Math.max(1, Math.floor(0.003 * sr));
-    for (let i=0;i<f;i++){ const t=i/f; o[want-1-i]*=t; }
+    for (let i=0;i*f<out.length && i<f;i++){ const t=i/f; o[out.length-1-i]*=t; }
     return out;
   }
   function fitOrScale(buf, newLen, mode){
@@ -588,6 +783,40 @@
     return '';
   }
   function toast(msg){ toastEl.textContent = msg; setTimeout(()=> toastEl.textContent='', 2500); }
+
+  // ====== Fallback recorder (ScriptProcessor; iOS compatible) ======
+  function createFallbackRecorder(sourceNode, ctx){
+    const rec = {
+      isRecording:false, _bufs:[], _script:null, _sr: ctx.sampleRate,
+      start(){
+        if (this.isRecording) return;
+        this._bufs = [];
+        const sp = ctx.createScriptProcessor(2048, 1, 1);
+        sourceNode.connect(sp); sp.connect(ctx.destination);
+        sp.onaudioprocess = (ev)=>{
+          if (!this.isRecording) return;
+          const ch = ev.inputBuffer.getChannelData(0);
+          this._bufs.push(new Float32Array(ch)); // copy
+        };
+        this._script = sp; this.isRecording = true;
+      },
+      stop(){
+        if (!this.isRecording) return;
+        this.isRecording = false;
+        try{ this._script.disconnect(); }catch{}
+        try{ sourceNode.disconnect(this._script); }catch{}
+      },
+      getAudioBuffer(){
+        const total = this._bufs.reduce((s,a)=>s+a.length,0);
+        if (total===0) return null;
+        const out = ctx.createBuffer(1, total, this._sr);
+        const o = out.getChannelData(0);
+        let off=0; for (const a of this._bufs){ o.set(a, off); off+=a.length; }
+        return out;
+      }
+    };
+    return rec;
+  }
 })();
 </script>
 </body>
