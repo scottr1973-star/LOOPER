@@ -1,6 +1,5 @@
-<!-- /index.html — Looper8+ MOBILE FIX (Mic enable + Record + WAV export + Save/Load)
-     Scope: ONLY mic init/recording + export + save/load logic. UI/other behavior untouched.
-     Created by Scott Russo -->
+<!-- /index.html — Looper8+ (Mic enable + Phone recording + WAV export + Save/Load + Monitor checkbox)
+     Scope: ONLY mic/record/export/save-load/monitor logic. UI and other behavior left intact. -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -121,6 +120,8 @@
   let recSchedule = null; // {track, startAtCtxActual, stopAtCtx, boundaryAtCtx}
   let fallbackRec = null; // iOS/Safari path
   let hiddenFileInput = null;
+  let monitorInitialized = false;
+  let monitorPrevValue = 0;
 
   const tracks = Array.from({length:N}, (_,i)=>({
     i, label:'T'+(i+1), colorClass:'c'+(i+1),
@@ -212,29 +213,40 @@
   }
 
   async function ensureMic(){
-    // Secure origin & top-level checks (GitHub Pages is OK)
     const secureOrigin = location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1';
     if (!secureOrigin){ toast('Open over HTTPS or localhost for mic.'); return false; }
     if (window.top !== window.self){ toast('If embedded in an iframe, add allow="microphone".'); return false; }
 
     if (!mediaStream){
       try{
-        // Simplest constraints for widest device support
+        // Simplest constraints for maximum device support
         mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
       }catch(e){
-        toast('Mic blocked. Allow mic for this site in the browser & system settings, then reload.');
+        toast('Mic blocked. Allow mic for this site in Android/Chrome settings, then reload.');
         return false;
       }
     }
-    // WebAudio path
     if (!inputNode){
       inputNode = audioCtx.createMediaStreamSource(mediaStream);
       analyser = audioCtx.createAnalyser(); analyser.fftSize = 512; analyser.smoothingTimeConstant = 0.85;
       monitorGain = audioCtx.createGain(); monitorGain.gain.value = 0.0;
       inputNode.connect(analyser); analyser.connect(monitorGain); monitorGain.connect(audioCtx.destination);
       tickMeter();
+
+      // Enable and wire the Monitor checkbox (once)
+      if (!monitorInitialized){
+        monitorChk.disabled = false;
+        monitorChk.checked = false; // start muted to avoid feedback
+        monitorChk.addEventListener('change', () => {
+          if (!monitorGain) return;
+          // safe level for mobile speakers to avoid howl
+          monitorGain.gain.value = monitorChk.checked ? 0.18 : 0.0;
+          const label = monitorChk.nextElementSibling;
+          if (label) label.textContent = monitorChk.checked ? 'Monitor input (ON)' : 'Monitor input';
+        });
+        monitorInitialized = true;
+      }
     }
-    // MediaRecorder if supported
     if (!mediaRec && window.MediaRecorder){
       const mime = getBestMime();
       try{ mediaRec = mime ? new MediaRecorder(mediaStream, {mimeType:mime}) : new MediaRecorder(mediaStream); }
@@ -244,7 +256,6 @@
         mediaRec.onstop = onRecordingComplete_MediaRecorder;
       }
     }
-    // Fallback (iOS/Safari)
     if (!fallbackRec){ fallbackRec = createFallbackRecorder(inputNode, audioCtx); }
     return true;
   }
@@ -291,7 +302,7 @@
     playing = false;
   }
 
-  // ====== Recording (MOBILE-SAFE; trim-to-boundary) ======
+  // ====== Recording (MOBILE-SAFE; trim-to-boundary; auto-mute monitor) ======
   async function safeRecordStart(i, recBtn, stopRecBtn){
     if (recBusy) return; recBusy = true;
 
@@ -301,6 +312,10 @@
     await ensureAudioReady();
     const ok = await ensureMic();
     if (!ok){ tr(i).recChip.className='chip idle'; tr(i).recChip.textContent='Idle'; recBusy=false; return; }
+
+    // Auto-mute monitor during recording to prevent feedback
+    monitorPrevValue = monitorGain ? monitorGain.gain.value : 0;
+    if (monitorGain) monitorGain.gain.value = 0.0;
 
     // UI lock
     recBtn.disabled = true; stopRecBtn.disabled = false;
@@ -320,9 +335,8 @@
       const stopAtCtx = boundaryAt + loopLenSec + (TAIL_MS/1000);
 
       if (usingMediaRecorder){
-        // Start immediately on tap (mobile requirement). We'll trim to boundary later.
         let startActual = audioCtx.currentTime;
-        try { mediaRec.start(); } catch(e){ toast('Recorder failed to start.'); endRecUI(i); recBusy=false; return; }
+        try { mediaRec.start(); } catch(e){ toast('Recorder failed to start.'); endRecUI(i); recBusy=false; restoreMonitorAfterRecord(); return; }
         recSchedule = { track:i, startAtCtxActual:startActual, stopAtCtx, boundaryAtCtx:boundaryAt };
         sweepRecordLEDs(i);
         waitUntil(stopAtCtx, () => {
@@ -332,7 +346,6 @@
           }
         });
       } else {
-        // Fallback on iOS
         fallbackRec.start();
         fallbackRec._startCtxActual = audioCtx.currentTime;
         recSchedule = { track:i, startAtCtxActual:fallbackRec._startCtxActual, stopAtCtx, boundaryAtCtx:boundaryAt };
@@ -343,7 +356,7 @@
     } else {
       // Free record (no loop defined yet)
       if (usingMediaRecorder){
-        try { mediaRec.start(); } catch(e){ toast('Recorder failed to start.'); endRecUI(i); recBusy=false; return; }
+        try { mediaRec.start(); } catch(e){ toast('Recorder failed to start.'); endRecUI(i); recBusy=false; restoreMonitorAfterRecord(); return; }
         sweepRecordLEDs(i);
       } else {
         fallbackRec.start(); fallbackRec._startCtxActual = audioCtx.currentTime;
@@ -382,9 +395,9 @@
     tr(i).recChip.className='chip idle'; tr(i).recChip.textContent='Idle';
 
     const blob = new Blob(chunks, {type: chunks[0]?.type || 'audio/webm'});
-    let ab; try { ab = await blob.arrayBuffer(); } catch { endRecUI(i); return; }
+    let ab; try { ab = await blob.arrayBuffer(); } catch { endRecUI(i); restoreMonitorAfterRecord(); return; }
     let buf = await audioCtx.decodeAudioData(ab).catch(()=>null);
-    if (!buf){ toast('Decode failed. Try Chrome/Edge/Safari 17+.'); endRecUI(i); return; }
+    if (!buf){ toast('Decode failed. Try Chrome/Edge/Safari 17+.'); endRecUI(i); restoreMonitorAfterRecord(); return; }
 
     buf = toMonoWithFades(buf, 0.004);
 
@@ -392,7 +405,6 @@
       const sr = buf.sampleRate;
       const startActual = recSchedule.startAtCtxActual;
       const boundary = recSchedule.boundaryAtCtx;
-      // Trim from actual start to boundary, take exactly one loop
       let pre = Math.max(0, Math.floor((boundary - startActual) * sr));
       const want = Math.max(1, Math.floor(loopLenSec * sr));
       let data = buf.getChannelData(0);
@@ -423,13 +435,14 @@
       src.start(now, elapsed); tr(i).source = src;
     }
     endRecUI(i);
+    restoreMonitorAfterRecord();
   }
 
   // Fallback completion (iOS)
   function onRecordingComplete_Fallback(i){
     tr(i).recChip.className='chip idle'; tr(i).recChip.textContent='Idle';
     let buf = fallbackRec.getAudioBuffer();
-    if (!buf){ endRecUI(i); return; }
+    if (!buf){ endRecUI(i); restoreMonitorAfterRecord(); return; }
     buf = toMonoWithFades(buf, 0.004);
 
     if (recSchedule && recSchedule.track === i){
@@ -466,6 +479,14 @@
       src.start(now, elapsed); tr(i).source = src;
     }
     endRecUI(i);
+    restoreMonitorAfterRecord();
+  }
+
+  function restoreMonitorAfterRecord(){
+    if (!monitorGain) return;
+    // If user has Monitor checked, restore previous level; otherwise keep muted
+    const wantsMonitor = monitorChk && monitorChk.checked;
+    monitorGain.gain.value = wantsMonitor ? (typeof monitorPrevValue === 'number' ? monitorPrevValue : 0.18) : 0.0;
   }
 
   function endRecUI(i){
@@ -578,7 +599,7 @@
   function getVolForIndex(i){
     const row = document.querySelectorAll('.tracks .track')[i];
     return row ? Number(row.querySelector('.vol').value)||1 : 1;
-  }
+    }
 
   // ====== SAVE / LOAD (single JSON with embedded WAVs) ======
   saveSessBtn.addEventListener('click', async ()=>{
@@ -678,7 +699,7 @@
   function downloadBlobAs(blob, filename){
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = filename; a.rel='noopener'; a.target = '_blank'; // iOS fallback
+    a.href = url; a.download = filename; a.rel='noopener'; a.target = '_blank'; // iOS fallback open-in-new-tab
     document.body.appendChild(a);
     a.click();
     setTimeout(()=>{ try{document.body.removeChild(a);}catch{} URL.revokeObjectURL(url); }, 1500);
@@ -734,7 +755,7 @@
     const o = out.getChannelData(0); const iData = buf.getChannelData(0);
     const n = Math.min(want, buf.length); o.set(iData.subarray(0,n), 0);
     const f = Math.max(1, Math.floor(0.003 * sr));
-    for (let i=0;i*f<out.length && i<f;i++){ const t=i/f; o[out.length-1-i]*=t; }
+    for (let i=0;i<f;i++){ const t=i/f; o[want-1-i]*=t; }
     return out;
   }
   function fitOrScale(buf, newLen, mode){
